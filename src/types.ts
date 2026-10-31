@@ -74,12 +74,30 @@ export type Slot = {
   staffName: string
 }
 
+export const PaymentStatus = {
+  DUE: 'DUE',
+  CREATED: 'CREATED',
+  PAID: 'PAID',
+  FAILED: 'FAILED',
+} as const
+
+export type PaymentStatus = (typeof PaymentStatus)[keyof typeof PaymentStatus]
+
+export type Payment = {
+  id: string
+  status: PaymentStatus
+  amountPaise: number
+  currency: string
+  holdExpiresAt: string
+}
+
 export type Booking = {
   id: string
   startAt: string
   endAt: string
   status: BookingStatus
   notes: string | null
+  payment?: Payment | null
   service?: SalonService
   staff?: {
     id: string

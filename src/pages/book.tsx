@@ -4,12 +4,22 @@ import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { Photo } from '../components/discovery'
 import { Button, Field, Input, Textarea } from '../components/ui'
 import { api, getErrorMessage } from '../lib/api'
+import { payBooking, priceToPaise, releasesHold } from '../lib/razorpay'
 import { formatDay, formatMoney, formatTime, hoursStatus, localDateInput } from '../lib/format'
 import { cn } from '../lib/cn'
 import { salonImage } from '../lib/presentation'
+import { watchSalon } from '../lib/realtime'
 import { useAuthStore } from '../store/auth'
 import { useBookingsStore } from '../store/bookings'
-import { Role, type PublicSalon, type Slot } from '../types'
+import { BookingStatus, Role, type Booking, type PublicSalon, type Slot } from '../types'
+
+function overlapsOwnVisit(slot: Slot, bookings: Booking[] | null, slug: string | undefined) {
+  return (bookings ?? []).some((booking) => {
+    if (!slug || booking.tenant?.slug !== slug) return false
+    if (booking.status !== BookingStatus.CONFIRMED && booking.status !== BookingStatus.PENDING) return false
+    return new Date(slot.startAt) < new Date(booking.endAt) && new Date(slot.endAt) > new Date(booking.startAt)
+  })
+}
 
 export function BookPage() {
   const { slug } = useParams()
@@ -17,6 +27,9 @@ export function BookPage() {
   const navigate = useNavigate()
   const user = useAuthStore((state) => state.user)
   const loadBookings = useBookingsStore((state) => state.load)
+  const myBookings = useBookingsStore((state) => state.bookings)
+  const bookingChanges = useBookingsStore((state) => state.changes)
+  const touchBookings = useBookingsStore((state) => state.touch)
   const [salon, setSalon] = useState<PublicSalon | null>(null)
   const [serviceId, setServiceId] = useState(params.get('service') ?? '')
   const [staffId, setStaffId] = useState(params.get('staff') ?? '')
@@ -28,8 +41,7 @@ export function BookPage() {
   const [message, setMessage] = useState('')
   const [loadingSalon, setLoadingSalon] = useState(true)
   const [loadingSlots, setLoadingSlots] = useState(false)
-  const [saving, setSaving] = useState(false)
-  const [slotVersion, setSlotVersion] = useState(0)
+  const [saving, setSaving] = useState<'now' | 'later' | null>(null)
 
   useEffect(() => {
     if (!slug) return
@@ -67,15 +79,19 @@ export function BookPage() {
     () => salon?.staff.filter((member) => !serviceId || member.serviceIds.includes(serviceId)) ?? [],
     [salon, serviceId],
   )
+  const openSlots = useMemo(
+    () => slots.filter((slot) => !overlapsOwnVisit(slot, myBookings, slug)),
+    [myBookings, slug, slots],
+  )
 
   useEffect(() => {
-    if (!user || !slug || slots.length === 0) return
+    if (!user || !slug || openSlots.length === 0) return
     const raw = sessionStorage.getItem('saloonia.customer.pending')
     if (!raw) return
     try {
       const pending = JSON.parse(raw) as { slug?: string; startAt?: string; staffId?: string; notes?: string }
       if (pending.slug !== slug) return
-      const match = slots.find((slot) => slot.startAt === pending.startAt && slot.staffId === pending.staffId)
+      const match = openSlots.find((slot) => slot.startAt === pending.startAt && slot.staffId === pending.staffId)
       if (!match) return
       setSelected(match)
       setNotes(pending.notes ?? '')
@@ -83,20 +99,33 @@ export function BookPage() {
     } catch {
       sessionStorage.removeItem('saloonia.customer.pending')
     }
-  }, [user, slug, slots])
+  }, [user, slug, openSlots])
+
+  useEffect(() => {
+    if (!slug) return
+    return watchSalon(slug)
+  }, [slug])
 
   useEffect(() => {
     if (!slug || !serviceId || !date) return
     const query = new URLSearchParams({ date, serviceId })
     if (staffId) query.set('staffId', staffId)
     setLoadingSlots(true)
-    setSelected(null)
     api
       .get<Slot[]>(`/public/salons/${slug}/slots?${query.toString()}`)
-      .then(({ data }) => setSlots(data))
+      .then(({ data }) => {
+        setSlots(data)
+        setSelected((current) =>
+          current &&
+          data.some((slot) => slot.startAt === current.startAt && slot.staffId === current.staffId) &&
+          !overlapsOwnVisit(current, useBookingsStore.getState().bookings, slug)
+            ? current
+            : null,
+        )
+      })
       .catch((err) => setError(getErrorMessage(err, 'Could not load open times.')))
       .finally(() => setLoadingSlots(false))
-  }, [slug, serviceId, staffId, date, slotVersion])
+  }, [slug, serviceId, staffId, date, bookingChanges])
 
   function chooseService(id: string) {
     setServiceId(id)
@@ -116,7 +145,7 @@ export function BookPage() {
     setParams(next, { replace: true })
   }
 
-  async function confirm() {
+  async function book(payNow: boolean) {
     if (!selected || !slug || !serviceId) return
     if (!user) {
       sessionStorage.setItem(
@@ -130,29 +159,64 @@ export function BookPage() {
       setError('Sign in with a guest account to book a chair.')
       return
     }
-    setSaving(true)
+    if (!service) return
+    setSaving(payNow ? 'now' : 'later')
     setError('')
     setMessage('')
+    let bookingId = ''
     try {
-      await api.post(`/public/salons/${slug}/bookings`, {
+      const { data } = await api.post<Booking>(`/public/salons/${slug}/bookings`, {
         serviceId,
         staffId: selected.staffId,
         startAt: selected.startAt,
         notes: notes.trim() || undefined,
+        payLater: !payNow,
       })
-      setMessage('The chair is booked.')
-      setSelected(null)
-      setNotes('')
-      setSlotVersion((current) => current + 1)
+      bookingId = data.id
+      if (!payNow) {
+        setMessage('The chair is booked. Pay at the salon, or pay from Payments whenever you like.')
+        setSelected(null)
+        setNotes('')
+        touchBookings()
+        void loadBookings()
+        return
+      }
+      const result = await payBooking({
+        bookingId: data.id,
+        amount: priceToPaise(service.price),
+        name: salon?.name ?? 'Saloonia',
+        description: service.name,
+        prefill: {
+          name: `${user.firstName} ${user.lastName}`.trim(),
+          email: user.email,
+          contact: user.phone ?? '',
+        },
+        onFailed: (reason) => setError(reason),
+      })
+      if (result === 'dismissed') {
+        await api.patch(`/bookings/${data.id}/status`, { status: BookingStatus.CANCELLED }).catch(() => undefined)
+        setMessage('Payment cancelled. The chair was released.')
+      } else {
+        setMessage('Paid. The chair is booked.')
+        setSelected(null)
+        setNotes('')
+      }
+      touchBookings()
       void loadBookings()
     } catch (err) {
-      setError(getErrorMessage(err, 'Could not complete the booking.'))
+      if (bookingId && releasesHold(err)) {
+        await api.patch(`/bookings/${bookingId}/status`, { status: BookingStatus.CANCELLED }).catch(() => undefined)
+      }
+      setError(getErrorMessage(err, err instanceof Error ? err.message : 'Could not complete the booking.'))
+      touchBookings()
+      void loadBookings()
     } finally {
-      setSaving(false)
+      setSaving(null)
     }
   }
 
-  const actionLabel = saving ? 'Booking…' : user ? 'Confirm chair' : 'Sign in to book'
+  const payNowLabel = saving === 'now' ? 'Opening checkout…' : service ? `Pay now ${formatMoney(service.price)}` : 'Pay now'
+  const payLaterLabel = saving === 'later' ? 'Booking…' : 'Pay later'
 
   if (loadingSalon) {
     return <p className="px-4 pt-6 text-sm text-muted">Loading the salon…</p>
@@ -163,7 +227,7 @@ export function BookPage() {
   }
 
   return (
-    <div className="mx-auto w-full max-w-6xl px-4 pt-4 pb-36 sm:px-6 lg:px-8 lg:pb-8">
+    <div className="mx-auto w-full max-w-6xl px-4 pt-4 pb-40 sm:px-6 lg:px-8 lg:pb-8">
       <Link to="/" className="inline-flex h-11 items-center gap-1 text-sm font-semibold">
         <ChevronLeft className="h-4 w-4" />
         Salons
@@ -236,9 +300,9 @@ export function BookPage() {
 
           <h2 className="mt-6 font-semibold">Open times</h2>
           {loadingSlots ? <p className="mt-3 text-sm text-muted">Checking the book…</p> : null}
-          {!loadingSlots && slots.length === 0 ? <p className="mt-3 text-sm text-muted">No open chairs for this day. Try another date or stylist.</p> : null}
+          {!loadingSlots && openSlots.length === 0 ? <p className="mt-3 text-sm text-muted">No open chairs for this day. Try another date or stylist.</p> : null}
           <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3">
-            {slots.map((slot) => {
+            {openSlots.map((slot) => {
               const active = selected?.startAt === slot.startAt && selected.staffId === slot.staffId
               return (
                 <button
@@ -290,16 +354,24 @@ export function BookPage() {
               </Link>
             </p>
           ) : null}
-          <Button type="button" className="mt-5 hidden w-full lg:inline-flex" disabled={!selected || saving} onClick={confirm}>
-            {actionLabel}
-          </Button>
+          <div className="mt-5 hidden gap-2 lg:grid">
+            <Button type="button" disabled={!selected || saving !== null} onClick={() => book(true)}>
+              {payNowLabel}
+            </Button>
+            <Button type="button" variant="secondary" disabled={!selected || saving !== null} onClick={() => book(false)}>
+              {payLaterLabel}
+            </Button>
+          </div>
         </section>
       </div>
 
       <div className="fixed inset-x-0 bottom-0 z-30 border-t border-[#e6ddd0] bg-[#fffdf9]/95 p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] backdrop-blur lg:hidden">
-        <div className="mx-auto w-full max-w-6xl">
-          <Button type="button" className="w-full" disabled={!selected || saving} onClick={confirm}>
-            {actionLabel}
+        <div className="mx-auto grid w-full max-w-6xl gap-2">
+          <Button type="button" disabled={!selected || saving !== null} onClick={() => book(true)}>
+            {payNowLabel}
+          </Button>
+          <Button type="button" variant="secondary" disabled={!selected || saving !== null} onClick={() => book(false)}>
+            {payLaterLabel}
           </Button>
         </div>
       </div>

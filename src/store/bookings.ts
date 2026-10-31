@@ -7,13 +7,17 @@ type BookingsState = {
   bookings: Booking[] | null
   loading: boolean
   error: string
+  changes: number
   load: () => Promise<void>
+  touch: () => void
 }
 
 export const useBookingsStore = create<BookingsState>((set) => ({
   bookings: null,
   loading: true,
   error: '',
+  changes: 0,
+  touch: () => set((state) => ({ changes: state.changes + 1 })),
   load: async () => {
     const user = useAuthStore.getState().user
     if (!user || user.role !== Role.CUSTOMER) {

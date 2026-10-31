@@ -11,7 +11,7 @@ export function nextBooking(bookings: Booking[]) {
 
 export function loyaltyPoints(bookings: Booking[]) {
   return (
-    bookings.filter((booking) => booking.status !== BookingStatus.CANCELLED && booking.status !== BookingStatus.NO_SHOW).length * 250
+    bookings.filter((booking) => booking.status === BookingStatus.CONFIRMED || booking.status === BookingStatus.COMPLETED).length * 250
   )
 }
 

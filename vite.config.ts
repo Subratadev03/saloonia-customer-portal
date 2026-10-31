@@ -17,8 +17,11 @@ export default defineConfig({
     port: 5174,
     strictPort: true,
     proxy: {
-      // '/api': 'http://localhost:4000',
-      '/api': 'https://saloonia-backend.vercel.app',
+      '/api': 'http://localhost:4000',
+      '/socket.io': {
+        target: 'http://localhost:4000',
+        ws: true,
+      },
     },
     watch: {
       usePolling: true,

@@ -2,6 +2,7 @@ import { useEffect, type ReactNode } from 'react'
 import { CircleUser, Scissors, Sparkles, Store } from 'lucide-react'
 import { NavLink, useLocation } from 'react-router-dom'
 import { cn } from '../lib/cn'
+import { subscribeBookingChanges } from '../lib/realtime'
 import { useAuthStore } from '../store/auth'
 import { useBookingsStore } from '../store/bookings'
 
@@ -14,6 +15,7 @@ const tabs = [
 
 export function Shell({ children }: { children: ReactNode }) {
   const location = useLocation()
+  const token = useAuthStore((state) => state.token)
   const userId = useAuthStore((state) => state.user?.id ?? null)
   const loadBookings = useBookingsStore((state) => state.load)
   const path = location.pathname
@@ -28,6 +30,13 @@ export function Shell({ children }: { children: ReactNode }) {
   useEffect(() => {
     void loadBookings()
   }, [loadBookings, userId])
+
+  useEffect(() => {
+    return subscribeBookingChanges(token, () => {
+      useBookingsStore.getState().touch()
+      void useBookingsStore.getState().load()
+    })
+  }, [token])
 
   return (
     <div className={cn('min-h-dvh', dark ? 'bg-account text-[#f6f1e8]' : 'bg-canvas text-ink')}>

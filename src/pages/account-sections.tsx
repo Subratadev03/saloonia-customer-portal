@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import { AccountFrame, SignInCard } from '../components/account-frame'
 import { Button, Field, Select, Textarea } from '../components/ui'
 import { api, getErrorMessage } from '../lib/api'
+import { payBooking, priceToPaise } from '../lib/razorpay'
 import { formatDay, formatMoney, formatTime, formatVisit } from '../lib/format'
 import { cn } from '../lib/cn'
 import { useCatalog } from '../lib/use-catalog'
@@ -11,7 +12,7 @@ import { useAuthStore } from '../store/auth'
 import { useBookingsStore } from '../store/bookings'
 import { isSaved, useFavorites } from '../store/favorites'
 import { beverageChoices, usePreferences } from '../store/preferences'
-import { BookingStatus, Role, type Booking } from '../types'
+import { BookingStatus, PaymentStatus, Role, type Booking } from '../types'
 import { Photo } from '../components/discovery'
 import { portraitImage, salonImage, shortName } from '../lib/presentation'
 
@@ -43,6 +44,35 @@ export function HistoryPage() {
   const error = useBookingsStore((state) => state.error)
   const load = useBookingsStore((state) => state.load)
   const [actionError, setActionError] = useState('')
+  const [payingId, setPayingId] = useState('')
+
+  async function pay(booking: Booking) {
+    if (!user || !booking.service) return
+    setPayingId(booking.id)
+    setActionError('')
+    try {
+      const result = await payBooking({
+        bookingId: booking.id,
+        amount: priceToPaise(booking.service.price),
+        name: booking.tenant?.name ?? 'Saloonia',
+        description: booking.service.name,
+        prefill: {
+          name: `${user.firstName} ${user.lastName}`.trim(),
+          email: user.email,
+          contact: user.phone ?? '',
+        },
+        onFailed: (reason) => setActionError(reason),
+      })
+      if (result === 'dismissed') {
+        setActionError('Checkout closed. This chair stays held until the timer ends.')
+      }
+      await load()
+    } catch (err) {
+      setActionError(getErrorMessage(err, err instanceof Error ? err.message : 'Payment could not be completed.'))
+    } finally {
+      setPayingId('')
+    }
+  }
 
   async function cancel(id: string) {
     setActionError('')
@@ -86,9 +116,18 @@ export function HistoryPage() {
                         {formatDay(booking.startAt)} · {formatTime(booking.startAt)} – {formatTime(booking.endAt)}
                       </p>
                       {booking.notes ? <p className="mt-2 text-sm leading-relaxed text-[#5f564c]">Formula: {booking.notes}</p> : null}
+                      {booking.payment?.status === PaymentStatus.PAID ? <p className="mt-2 text-sm text-[#245532]">Paid online</p> : null}
+                      {booking.payment?.status === PaymentStatus.DUE ? <p className="mt-2 text-sm text-[#6d5014]">Pay later</p> : null}
                     </div>
                     <div className="flex items-center gap-3">
                       <span className={cn('rounded-full px-3 py-1 text-xs font-semibold', tone[booking.status])}>{statusLabel[booking.status]}</span>
+                      {booking.service &&
+                      booking.payment?.status !== PaymentStatus.PAID &&
+                      (booking.status === BookingStatus.PENDING || booking.payment?.status === PaymentStatus.DUE) ? (
+                        <Button type="button" disabled={payingId === booking.id} onClick={() => pay(booking)}>
+                          {payingId === booking.id ? 'Opening checkout…' : `Pay ${formatMoney(booking.service.price)}`}
+                        </Button>
+                      ) : null}
                       {canCancel ? (
                         <Button type="button" variant="secondary" onClick={() => cancel(booking.id)}>
                           Cancel
@@ -220,8 +259,47 @@ export function RewardsPage() {
 export function PaymentsPage() {
   const user = useCustomer()
   const bookings = useBookingsStore((state) => state.bookings)
+  const load = useBookingsStore((state) => state.load)
   const kept = (bookings ?? []).filter((booking) => booking.status !== BookingStatus.CANCELLED)
-  const total = kept.reduce((sum, booking) => sum + Number(booking.service?.price ?? 0), 0)
+  const due = kept.filter(
+    (booking) =>
+      booking.payment?.status === PaymentStatus.DUE ||
+      booking.payment?.status === PaymentStatus.CREATED ||
+      booking.status === BookingStatus.PENDING,
+  )
+  const paid = kept.filter((booking) => booking.payment?.status === PaymentStatus.PAID)
+  const paidTotal = paid.reduce((sum, booking) => sum + Number(booking.service?.price ?? 0), 0)
+  const dueTotal = due.reduce((sum, booking) => sum + Number(booking.service?.price ?? 0), 0)
+  const [payingId, setPayingId] = useState('')
+  const [actionError, setActionError] = useState('')
+
+  async function pay(booking: Booking) {
+    if (!user || !booking.service) return
+    setPayingId(booking.id)
+    setActionError('')
+    try {
+      const result = await payBooking({
+        bookingId: booking.id,
+        amount: priceToPaise(booking.service.price),
+        name: booking.tenant?.name ?? 'Saloonia',
+        description: booking.service.name,
+        prefill: {
+          name: `${user.firstName} ${user.lastName}`.trim(),
+          email: user.email,
+          contact: user.phone ?? '',
+        },
+        onFailed: (reason) => setActionError(reason),
+      })
+      if (result === 'dismissed') {
+        setActionError('Checkout closed. You can pay again while the chair is held.')
+      }
+      await load()
+    } catch (err) {
+      setActionError(getErrorMessage(err, err instanceof Error ? err.message : 'Payment could not be completed.'))
+    } finally {
+      setPayingId('')
+    }
+  }
 
   return (
     <AccountFrame title="Payments & Deposits">
@@ -229,24 +307,55 @@ export function PaymentsPage() {
       {user ? (
         <div className="grid gap-3">
           <section className="rounded-[24px] bg-[#fffdf9] p-5 text-ink">
-            <p className="text-sm text-muted">Visit charges on your name</p>
-            <p className="mt-2 text-3xl font-bold">{formatMoney(total)}</p>
-            <p className="mt-2 text-sm leading-relaxed text-muted">Saloonia holds the chair. You pay the salon at the visit. Nothing is charged in the app.</p>
+            <p className="text-sm text-muted">Paid with Razorpay</p>
+            <p className="mt-2 text-3xl font-bold">{formatMoney(paidTotal)}</p>
+            <p className="mt-2 text-sm leading-relaxed text-muted">
+              {dueTotal > 0
+                ? `${formatMoney(dueTotal)} is still due. Pay now with Razorpay, or at the salon.`
+                : 'Pay now checks out with Razorpay. Pay later keeps the chair until you are ready.'}
+            </p>
           </section>
+          {actionError ? <p className="text-sm text-[#f0c2bc]">{actionError}</p> : null}
           {kept.length === 0 ? <p className="text-sm text-[#c9c2b4]">No visit charges yet.</p> : null}
-          {kept.map((booking) => (
-            <article key={booking.id} className="rounded-[24px] bg-[#fffdf9] p-4 text-ink">
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <p className="font-semibold">{booking.service?.name ?? 'Visit'}</p>
-                  <p className="mt-1 text-sm text-muted">
-                    {booking.tenant?.name} · {formatVisit(booking.startAt)}
-                  </p>
+          {kept.map((booking) => {
+            const unpaid =
+              booking.service &&
+              booking.payment?.status !== PaymentStatus.PAID &&
+              (booking.status === BookingStatus.PENDING ||
+                booking.payment?.status === PaymentStatus.DUE ||
+                booking.payment?.status === PaymentStatus.CREATED)
+                ? booking.service
+                : null
+            const chargeLabel =
+              booking.payment?.status === PaymentStatus.PAID
+                ? 'Paid'
+                : booking.payment?.status === PaymentStatus.DUE
+                  ? 'Pay later'
+                  : booking.status === BookingStatus.PENDING
+                    ? 'Waiting for payment'
+                    : 'Booked by the salon'
+            return (
+              <article key={booking.id} className="rounded-[24px] bg-[#fffdf9] p-4 text-ink">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="font-semibold">{booking.service?.name ?? 'Visit'}</p>
+                    <p className="mt-1 text-sm text-muted">
+                      {booking.tenant?.name} · {formatVisit(booking.startAt)}
+                    </p>
+                    <p className="mt-1 text-sm text-muted">
+                      {chargeLabel}
+                    </p>
+                  </div>
+                  <p className="shrink-0 font-semibold">{booking.service ? formatMoney(booking.service.price) : '—'}</p>
                 </div>
-                <p className="shrink-0 font-semibold">{booking.service ? formatMoney(booking.service.price) : '—'}</p>
-              </div>
-            </article>
-          ))}
+                {unpaid ? (
+                  <Button type="button" className="mt-4 w-full" disabled={payingId === booking.id} onClick={() => pay(booking)}>
+                    {payingId === booking.id ? 'Opening checkout…' : `Pay ${formatMoney(unpaid.price)}`}
+                  </Button>
+                ) : null}
+              </article>
+            )
+          })}
         </div>
       ) : null}
     </AccountFrame>
@@ -310,7 +419,7 @@ export function PreferencesPage() {
 const faqs = [
   {
     question: 'How do I book?',
-    answer: 'Choose a salon, a treatment, a stylist, and an open time. Confirming the chair asks you to sign in as a guest.',
+    answer: 'Choose a salon, a treatment, a stylist, and an open time. Pay now opens Razorpay. Pay later confirms the chair and you can pay at the salon or from Payments.',
   },
   {
     question: 'How do I cancel?',

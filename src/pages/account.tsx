@@ -10,7 +10,7 @@ const menu = [
   { to: '/account/history', label: 'Booking History & Formulas', detail: 'past bookings details', icon: CalendarDays },
   { to: '/account/favorites', label: 'My Faves', detail: 'salons, stylists', icon: Heart },
   { to: '/account/rewards', label: 'Rewards & Gift Cards', detail: 'points, tiers', icon: Gift },
-  { to: '/account/payments', label: 'Payments & Deposits', detail: 'visit charges', icon: CreditCard },
+  { to: '/account/payments', label: 'Payments & Deposits', detail: 'Razorpay checkout', icon: CreditCard },
   { to: '/account/preferences', label: 'Preferences', detail: 'hair history, beverage choice', icon: SlidersHorizontal },
   { to: '/account/support', label: 'Support & Help', detail: 'chat, FAQ', icon: MessageCircle },
 ]
